@@ -667,6 +667,11 @@ class Scheduler(SchedulerInterface):
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
 
+        # collect freed block IDs that need to be zeroed by the worker
+        freed_block_ids = self.kv_cache_manager.take_freed_block_ids()
+        if freed_block_ids:
+            scheduler_output.block_ids_to_zero = freed_block_ids
+
         # collect KV cache events from connector
         if self.connector is not None:
             connector_events = self.connector.take_events()

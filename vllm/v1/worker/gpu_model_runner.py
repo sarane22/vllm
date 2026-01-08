@@ -620,6 +620,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Zero freed KV cache blocks to prevent state contamination
+        if scheduler_output.block_ids_to_zero:
+            self._zero_kv_cache_blocks(scheduler_output.block_ids_to_zero)
+        
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -4269,6 +4273,51 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     else 0
                 ),
             )
+
+    def _zero_kv_cache_blocks(self, block_ids: list[int]) -> None:
+        """Zero the KV cache blocks to prevent state contamination when reused.
+        
+        This is critical for Mamba layers where conv_state and ssm_state must
+        be clean when blocks are reused by new requests.
+        
+        Args:
+            block_ids: List of block IDs to zero.
+        """
+        if not block_ids:
+            return
+        
+        zeroed_count = 0
+        
+        logger.info(f"[WORKER_ZERO_BLOCKS] Zeroing {len(block_ids)} blocks: {block_ids[:10]}{'...' if len(block_ids) > 10 else ''}")
+        
+        # Access KV cache from model layers
+        for layer_name, layer in self.model.named_modules():
+            if not hasattr(layer, 'kv_cache'):
+                continue
+            
+            kv_cache = layer.kv_cache
+            
+            # kv_cache is typically a tuple of (list of tensors per virtual engine)
+            # For single virtual engine: kv_cache[0] = [conv_state, ssm_state] for Mamba
+            # or kv_cache[0] = single_tensor for Attention
+            if isinstance(kv_cache, (list, tuple)) and len(kv_cache) > 0:
+                for ve_idx, ve_cache in enumerate(kv_cache):
+                    if isinstance(ve_cache, (list, tuple)):
+                        # Mamba: [conv_state, ssm_state]
+                        for state_idx, state_tensor in enumerate(ve_cache):
+                            if isinstance(state_tensor, torch.Tensor) and state_tensor.numel() > 0:
+                                for block_id in block_ids:
+                                    if len(state_tensor.shape) > 0 and block_id < state_tensor.shape[0]:
+                                        state_tensor[block_id].zero_()
+                                        zeroed_count += 1
+                    elif isinstance(ve_cache, torch.Tensor) and ve_cache.numel() > 0:
+                        # Attention: single tensor
+                        for block_id in block_ids:
+                            if len(ve_cache.shape) > 0 and block_id < ve_cache.shape[0]:
+                                ve_cache[block_id].zero_()
+                                zeroed_count += 1
+        
+        logger.info(f"[WORKER_ZERO_BLOCKS] Zeroed {zeroed_count} tensors across {len(block_ids)} blocks")
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
