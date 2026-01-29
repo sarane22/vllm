@@ -62,6 +62,10 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
         self.await_inputs = vllm_config.model_config.custom_input_specs is not None
+        # CFG (Classifier Free Guidance) support - check if model enables it
+        self.enable_guidance = getattr(
+            vllm_config.model_config.hf_config, "enable_guidance", False
+        )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -231,7 +235,15 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+
+            # Check for CFG pair early - we need to reserve budget for both
+            # cond and uncond requests when computing the chunk size
+            cfg_uncond = self.cfg_pairs.get(request.request_id)
+
+            # For CFG pairs, divide budget by 2 so both cond and uncond fit
+            num_new_tokens = min(
+                num_new_tokens, token_budget // (2 if cfg_uncond else 1)
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1205,6 +1217,37 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+
+        # Check if CFG is enabled and create unconditional clone
+        # CFG pairs are NOT added to waiting/running queues - their lifecycle
+        # is entirely managed through their conditional request.
+        if (
+            request.sampling_params is not None
+            and request.sampling_params.guidance_scale is not None
+            and not request.is_cfg_unconditional  # Don't clone the clone
+        ):
+            # Validate that guidance is enabled in model config
+            if not self.enable_guidance:
+                raise ValueError(
+                    "guidance_scale is set but the model does not support "
+                    "guidance. Set enable_guidance=True in the model config "
+                    "to enable Classifier Free Guidance (CFG)."
+                )
+            uncond_request = request.create_cfg_unconditional_clone()
+            self.cfg_pairs[request.request_id] = uncond_request
+            # Also add to requests dict for lookup purposes
+            self.requests[uncond_request.request_id] = uncond_request
+
+    def get_cfg_uncond_request(self, request: Request) -> Request | None:
+        """Get the unconditional CFG request paired with a conditional request.
+
+        Args:
+            request: The conditional request.
+
+        Returns:
+            The unconditional request, or None if not a CFG pair.
+        """
+        return self.cfg_pairs.get(request.request_id)
 
     def set_custom_inputs(self, request_id: str, custom_inputs: dict[str, torch.Tensor]) -> None:
         """
