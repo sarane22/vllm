@@ -28,6 +28,14 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+# Suffix appended to conditional request IDs to create unconditional request IDs
+CFG_UNCOND_SUFFIX = ":cfg_uncond"
+
+
+def get_cfg_uncond_request_id(cond_request_id: str) -> str:
+    """Get the unconditional request ID from a conditional request ID."""
+    return f"{cond_request_id}{CFG_UNCOND_SUFFIX}"
+
 class Request:
     def __init__(
         self,
